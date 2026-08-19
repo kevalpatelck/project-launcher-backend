@@ -258,19 +258,72 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   }
 });
 
+// Find PID listening on a port (cross-platform Windows/macOS/Linux)
+function findPidByPort(port) {
+  return new Promise((resolve) => {
+    if (!port || isNaN(port)) return resolve(null);
+    if (process.platform === 'win32') {
+      execFile('netstat', ['-ano', '-p', 'tcp'], (err, stdout) => {
+        if (err || !stdout) return resolve(null);
+        const lines = stdout.split('\n');
+        for (const line of lines) {
+          if (line.includes(`:${port}`) && line.includes('LISTENING')) {
+            const parts = line.trim().split(/\s+/);
+            const pid = parseInt(parts[parts.length - 1], 10);
+            if (pid && pid > 0) return resolve(pid);
+          }
+        }
+        resolve(null);
+      });
+    } else {
+      execFile('lsof', ['-i', `:${port}`, '-t'], (err, stdout) => {
+        if (err || !stdout) return resolve(null);
+        const pid = parseInt(stdout.trim().split('\n')[0], 10);
+        resolve(pid || null);
+      });
+    }
+  });
+}
+
 // ---- PROTECTED PROJECT ROUTES ----
 app.get('/api/projects', authenticateToken, async (req, res) => {
   try {
     const projects = await Project.find({ userId: req.user.id }).sort({ createdAt: -1 });
-    const withStatus = projects.map((p) => {
+    const withStatus = await Promise.all(projects.map(async (p) => {
       const doc = p.toObject();
       const s = getState(p._id.toString());
+
+      // 1. If PID exists in memory, verify if it's still alive in OS
+      if (s.status === 'running' && s.pid) {
+        try {
+          process.kill(s.pid, 0);
+        } catch {
+          s.status = 'stopped';
+          s.pid = null;
+        }
+      }
+
+      // 2. Check if the configured/detected port is actually in use in OS
+      const targetPort = p.port || s.detectedPort;
+      if (targetPort) {
+        const inUse = await checkPortInUse(targetPort);
+        if (inUse) {
+          s.status = 'running';
+          if (!s.pid) {
+            const foundPid = await findPidByPort(targetPort);
+            if (foundPid) s.pid = foundPid;
+          }
+        } else if (!s.proc) {
+          s.status = 'stopped';
+        }
+      }
+
       return {
         ...doc,
         status: s.status,
         detectedPort: s.detectedPort,
       };
-    });
+    }));
     res.json(withStatus);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -466,20 +519,32 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
 app.post('/api/stop/:id', authenticateToken, async (req, res) => {
   try {
     const pId = req.params.id;
+    const project = await Project.findOne({ _id: pId, userId: req.user.id });
     const state = getState(pId);
-    if (!state.pid) {
+
+    let pidToKill = state.pid;
+    const targetPort = (project && project.port) || state.detectedPort;
+    if (!pidToKill && targetPort) {
+      pidToKill = await findPidByPort(targetPort);
+    }
+
+    if (!pidToKill) {
       state.status = 'stopped';
+      state.detectedPort = null;
       return res.json({ ok: true });
     }
 
-    treeKill(state.pid, 'SIGTERM', (err) => {
+    console.log(`◼ [STOP] Stopping "${project ? project.name : pId}" (Killing PID ${pidToKill})...`);
+
+    treeKill(pidToKill, 'SIGTERM', (err) => {
       if (err) {
-        try { process.kill(state.pid); } catch { }
+        try { process.kill(pidToKill, 'SIGKILL'); } catch { }
       }
       state.status = 'stopped';
       state.pid = null;
       state.proc = null;
-      pushLog(pId, `# stopped by user`);
+      state.detectedPort = null;
+      pushLog(pId, `# stopped by user (PID ${pidToKill})`);
       res.json({ ok: true });
     });
   } catch (err) {
