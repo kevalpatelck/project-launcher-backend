@@ -2,13 +2,14 @@ require('dotenv').config();
 const dns = require('dns');
 try {
   dns.setServers(['8.8.8.8', '1.1.1.1']);
-} catch {}
+} catch { }
 
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const net = require('net');
 const { spawn, execFile } = require('child_process');
 const treeKill = require('tree-kill');
 const jwt = require('jsonwebtoken');
@@ -22,7 +23,13 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/launchpad'
 const JWT_SECRET = process.env.JWT_SECRET || 'launchpad_dev_secret_key_default_9988';
 
 const app = express();
-app.use(cors());
+// Enable full CORS for Cloudflare Pages (*.pages.dev) and local development
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Health check endpoint for UptimeRobot / Keep-alive
@@ -117,7 +124,7 @@ function detectProjectInfo(dirPath) {
         else if (pkg.scripts.start) info.suggestedCommand = 'npm start';
         else if (pkg.scripts.serve) info.suggestedCommand = 'npm run serve';
       }
-    } catch {}
+    } catch { }
   } else if (fs.existsSync(path.join(dirPath, 'run.py'))) {
     info.suggestedCommand = 'python run.py server';
   } else if (fs.existsSync(path.join(dirPath, 'main.py'))) {
@@ -317,7 +324,7 @@ app.delete('/api/projects/:id', authenticateToken, async (req, res) => {
     const pId = req.params.id;
     const state = runtime.get(pId);
     if (state && state.pid) {
-      try { treeKill(state.pid); } catch {}
+      try { treeKill(state.pid); } catch { }
     }
     runtime.delete(pId);
 
@@ -326,6 +333,22 @@ app.delete('/api/projects/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Check if a local port is already occupied
+function checkPortInUse(port) {
+  return new Promise((resolve) => {
+    if (!port || isNaN(port)) return resolve(false);
+    const tester = net.createServer()
+      .once('error', (err) => {
+        if (err.code === 'EADDRINUSE') return resolve(true);
+        resolve(false);
+      })
+      .once('listening', () => {
+        tester.once('close', () => resolve(false)).close();
+      })
+      .listen(port, '127.0.0.1');
+  });
+}
 
 // Start a project
 app.post('/api/start/:id', authenticateToken, async (req, res) => {
@@ -337,17 +360,35 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
     const state = getState(pId);
     if (state.status === 'running') return res.json({ ok: true, alreadyRunning: true });
 
-    if (!project.dir || !fs.existsSync(project.dir)) {
-      return res.status(400).json({ error: `Folder not found: ${project.dir}` });
+    // 1. Normalize and resolve project folder path for Windows / POSIX
+    const projectPath = path.resolve(path.normalize(project.dir.trim()));
+    console.log(`\n▶ [LAUNCH] Request to start "${project.name}"`);
+    console.log(`  ├─ Resolved Path: ${projectPath}`);
+    console.log(`  ├─ Command:       ${project.command}`);
+    console.log(`  └─ Port:          ${project.port || 'None'}`);
+
+    if (!fs.existsSync(projectPath)) {
+      const errMsg = `Folder not found on this machine: "${projectPath}". Please ensure the backend agent is running locally on the PC where your files exist.`;
+      console.error(`✗ [LAUNCH ERROR] ${errMsg}`);
+      return res.status(400).json({ error: errMsg });
+    }
+
+    // 2. Check if port is already in use
+    if (project.port) {
+      const inUse = await checkPortInUse(project.port);
+      if (inUse) {
+        console.warn(`⚠️ [PORT WARNING] Port ${project.port} is already in use by another running process.`);
+      }
     }
 
     state.logs = [];
     state.status = 'starting';
 
+    // 3. Spawn child process with shell: true for Windows .cmd/.bat resolution
     const child = spawn(project.command, {
-      cwd: project.dir,
+      cwd: projectPath,
       shell: true,
-      env: process.env,
+      env: { ...process.env, FORCE_COLOR: '1' },
     });
 
     state.proc = child;
@@ -356,12 +397,22 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
     state.startedAt = Date.now();
 
     pushLog(pId, `$ ${project.command}`);
-    pushLog(pId, `# started in ${project.dir} (pid ${child.pid})`);
+    pushLog(pId, `# started in ${projectPath} (PID: ${child.pid})`);
 
-    child.stdout.on('data', (d) => pushLog(pId, d.toString()));
-    child.stderr.on('data', (d) => pushLog(pId, d.toString()));
+    child.stdout.on('data', (d) => {
+      const str = d.toString();
+      process.stdout.write(`[${project.name} STDOUT] ${str}`);
+      pushLog(pId, str);
+    });
 
-    child.on('exit', (code) => {
+    child.stderr.on('data', (d) => {
+      const str = d.toString();
+      process.stderr.write(`[${project.name} STDERR] ${str}`);
+      pushLog(pId, str);
+    });
+
+    child.on('exit', (code, signal) => {
+      console.log(`◼ [EXIT] "${project.name}" exited with code ${code} signal ${signal}`);
       pushLog(pId, `# process exited with code ${code}`);
       state.status = 'stopped';
       state.pid = null;
@@ -369,7 +420,8 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
     });
 
     child.on('error', (err) => {
-      pushLog(pId, `# error: ${err.message}`);
+      console.error(`✗ [PROCESS ERROR] "${project.name}":`, err.message);
+      pushLog(pId, `# spawn error: ${err.message}`);
       state.status = 'stopped';
       state.pid = null;
       state.proc = null;
@@ -383,9 +435,10 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
       }, 2500);
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, pid: child.pid });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(`✗ [API ERROR /api/start]:`, err.message);
+    res.status(500).json({ error: `Server error starting project: ${err.message}` });
   }
 });
 
@@ -401,7 +454,7 @@ app.post('/api/stop/:id', authenticateToken, async (req, res) => {
 
     treeKill(state.pid, 'SIGTERM', (err) => {
       if (err) {
-        try { process.kill(state.pid); } catch {}
+        try { process.kill(state.pid); } catch { }
       }
       state.status = 'stopped';
       state.pid = null;
@@ -473,7 +526,7 @@ app.post('/api/browse-folder', async (req, res) => {
 function shutdownAll() {
   for (const [id, state] of runtime.entries()) {
     if (state.pid) {
-      try { treeKill(state.pid); } catch {}
+      try { treeKill(state.pid); } catch { }
     }
   }
 }
