@@ -32,9 +32,9 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Health check endpoint for UptimeRobot / Keep-alive
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+// Health check endpoints (no auth required)
+app.get(['/health', '/api/health'], (req, res) => {
+  res.json({ ok: true, status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
 // Connect to MongoDB
