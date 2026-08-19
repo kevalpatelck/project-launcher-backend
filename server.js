@@ -154,6 +154,7 @@ function getState(id) {
       logs: [],
       clients: new Set(),
       startedAt: null,
+      detectedPort: null,
     });
   }
   return runtime.get(id);
@@ -263,9 +264,11 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
     const projects = await Project.find({ userId: req.user.id }).sort({ createdAt: -1 });
     const withStatus = projects.map((p) => {
       const doc = p.toObject();
+      const s = getState(p._id.toString());
       return {
         ...doc,
-        status: getState(p._id.toString()).status,
+        status: s.status,
+        detectedPort: s.detectedPort,
       };
     });
     res.json(withStatus);
@@ -403,6 +406,21 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
       const str = d.toString();
       process.stdout.write(`[${project.name} STDOUT] ${str}`);
       pushLog(pId, str);
+
+      // Auto-detect running port from dev server stdout (Vite, Next.js, CRA, Express, Flask, etc.)
+      const match = str.match(/https?:\/\/(?:localhost|127\.0\.0\.1):(\d+)/i) ||
+                    str.match(/(?:localhost|127\.0\.0\.1):(\d+)/i) ||
+                    str.match(/(?:port|listening on|ready in|ready on|running on)\s*:?\s*(\d{4,5})/i);
+      if (match && match[1]) {
+        const foundPort = Number(match[1]);
+        if (!state.detectedPort && foundPort > 80 && foundPort < 65535) {
+          state.detectedPort = foundPort;
+          console.log(`✓ [PORT AUTO-DETECTED] "${project.name}" running on port ${foundPort}`);
+          if (project.autoOpen && !project.port) {
+            openBrowser(`http://localhost:${foundPort}`);
+          }
+        }
+      }
     });
 
     child.stderr.on('data', (d) => {
@@ -415,6 +433,7 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
       console.log(`◼ [EXIT] "${project.name}" exited with code ${code} signal ${signal}`);
       pushLog(pId, `# process exited with code ${code}`);
       state.status = 'stopped';
+      state.detectedPort = null;
       state.pid = null;
       state.proc = null;
     });
@@ -423,6 +442,7 @@ app.post('/api/start/:id', authenticateToken, async (req, res) => {
       console.error(`✗ [PROCESS ERROR] "${project.name}":`, err.message);
       pushLog(pId, `# spawn error: ${err.message}`);
       state.status = 'stopped';
+      state.detectedPort = null;
       state.pid = null;
       state.proc = null;
     });
